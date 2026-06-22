@@ -14,6 +14,12 @@
 #define ATTITUDE_KALMAN_Q_BIAS      0.003f
 #define ATTITUDE_KALMAN_R_MEASURE   0.03f
 
+/*
+ * BMI088 is mounted with sensor X+ pointing left and sensor Y- pointing
+ * forward, so sensor Y+ points backward. With sensor Z+ up, gyro Z+ is a
+ * left-turn yaw rate; heading hold depends on this yaw sign.
+ */
+
 typedef struct
 {
     float angle;
@@ -31,6 +37,7 @@ static uint32_t last_tick;
 static uint8_t filter_ready;
 static Attitude_Kalman1D roll_kalman;
 static Attitude_Kalman1D pitch_kalman;
+static Attitude_Kalman1D yaw_kalman;
 
 static int32_t Attitude_ScaleRawToMilli(int32_t raw, int32_t full_scale_milli)
 {
@@ -86,6 +93,43 @@ static float Attitude_KalmanUpdate(Attitude_Kalman1D *filter,
     float k1 = filter->p10 / innovation_cov;
 
     filter->angle += k0 * innovation;
+    filter->bias += k1 * innovation;
+
+    float p00_temp = filter->p00;
+    float p01_temp = filter->p01;
+
+    filter->p00 -= k0 * p00_temp;
+    filter->p01 -= k0 * p01_temp;
+    filter->p10 -= k1 * p00_temp;
+    filter->p11 -= k1 * p01_temp;
+
+    return filter->angle;
+}
+
+static float Attitude_KalmanPredict(Attitude_Kalman1D *filter,
+                                    float measured_rate_dps,
+                                    float dt_s)
+{
+    float rate = measured_rate_dps - filter->bias;
+    filter->angle = Attitude_WrapDeg(filter->angle + (dt_s * rate));
+
+    filter->p00 += dt_s * ((dt_s * filter->p11) - filter->p01 - filter->p10 + ATTITUDE_KALMAN_Q_ANGLE);
+    filter->p01 -= dt_s * filter->p11;
+    filter->p10 -= dt_s * filter->p11;
+    filter->p11 += ATTITUDE_KALMAN_Q_BIAS * dt_s;
+
+    return filter->angle;
+}
+
+static float Attitude_KalmanCorrectWrapped(Attitude_Kalman1D *filter,
+                                           float measured_angle_deg)
+{
+    float innovation = Attitude_WrapDeg(measured_angle_deg - filter->angle);
+    float innovation_cov = filter->p00 + ATTITUDE_KALMAN_R_MEASURE;
+    float k0 = filter->p00 / innovation_cov;
+    float k1 = filter->p10 / innovation_cov;
+
+    filter->angle = Attitude_WrapDeg(filter->angle + (k0 * innovation));
     filter->bias += k1 * innovation;
 
     float p00_temp = filter->p00;
@@ -198,6 +242,7 @@ void Attitude_Init(Attitude_State *state)
     filter_ready = 0U;
     Attitude_KalmanInit(&roll_kalman, 0.0f);
     Attitude_KalmanInit(&pitch_kalman, 0.0f);
+    Attitude_KalmanInit(&yaw_kalman, 0.0f);
 }
 
 void Attitude_Update(Attitude_State *state,
@@ -258,6 +303,7 @@ void Attitude_Update9Axis(Attitude_State *state,
         yaw_deg = 0.0f;
         Attitude_KalmanInit(&roll_kalman, roll_deg);
         Attitude_KalmanInit(&pitch_kalman, pitch_deg);
+        Attitude_KalmanInit(&yaw_kalman, yaw_deg);
         filter_ready = 1U;
     }
     else
@@ -267,17 +313,14 @@ void Attitude_Update9Axis(Attitude_State *state,
 
         roll_deg = Attitude_KalmanUpdate(&roll_kalman, accel_roll_deg, gyro_x_dps, dt_s);
         pitch_deg = Attitude_KalmanUpdate(&pitch_kalman, accel_pitch_deg, gyro_y_dps, dt_s);
-        yaw_deg += gyro_z_dps * dt_s;
+        yaw_deg = Attitude_KalmanPredict(&yaw_kalman, gyro_z_dps, dt_s);
     }
 
     if (mag != NULL)
     {
         state->mag_yaw_cdeg = Attitude_CalcMagYawCdeg(mag, roll_deg, pitch_deg);
         float mag_yaw_deg = (float)state->mag_yaw_cdeg / 100.0f;
-        float yaw_error_deg = Attitude_WrapDeg(mag_yaw_deg - yaw_deg);
-
-        yaw_deg += (1.0f - ATTITUDE_MAG_YAW_ALPHA) * yaw_error_deg;
-        yaw_deg = Attitude_WrapDeg(yaw_deg);
+        yaw_deg = Attitude_KalmanCorrectWrapped(&yaw_kalman, mag_yaw_deg);
     }
     else
     {

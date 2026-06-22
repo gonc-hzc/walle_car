@@ -50,11 +50,20 @@
 #define STRAIGHT_SYNC_KD 0.0f
 #define STRAIGHT_SYNC_OUTPUT_LIMIT 6.0f
 #define STRAIGHT_SYNC_INTEGRAL_LIMIT 100.0f
-#define HEADING_HOLD_KP 0.18f
-#define HEADING_HOLD_KI 0.002f
+#define HEADING_HOLD_KP 0.45f
+#define HEADING_HOLD_KI 0.006f
 #define HEADING_HOLD_KD 0.0f
-#define HEADING_HOLD_OUTPUT_LIMIT 5.0f
-#define HEADING_HOLD_INTEGRAL_LIMIT 300.0f
+#define HEADING_HOLD_OUTPUT_LIMIT 12.0f
+#define HEADING_HOLD_INTEGRAL_LIMIT 500.0f
+#define HEADING_HOLD_DEADBAND_CDEG 50
+#define HEADING_HOLD_YAW_SIGN 1.0f
+#define HEADING_HOLD_RATE_GAIN 0.08f
+#define HEADING_HOLD_GYRO_FS_DPS 2000.0f
+#define HEADING_HOLD_GYRO_RAW_FULL_SCALE 32768.0f
+#define FORWARD_LEFT_DRIFT_TRIM 1.5f
+#define FORWARD_START_LEFT_DRIFT_TRIM 2.0f
+#define FORWARD_START_TRIM_MS 350U
+#define BACKWARD_RIGHT_DRIFT_TRIM 1.0f
 #define IMU_UPDATE_PERIOD_MS 20U
 
 PID_t pid_left;
@@ -65,6 +74,8 @@ PID_t pid_heading_hold;
 volatile int16_t left_speed = 0;
 volatile int16_t right_speed = 0;
 volatile float straight_sync_adjust = 0.0f;
+volatile float heading_hold_adjust = 0.0f;
+volatile int32_t heading_hold_error_cdeg = 0;
 volatile int32_t imu_yaw_cdeg = 0;
 volatile uint8_t imu_heading_ready = 0;
 
@@ -82,6 +93,8 @@ static uint8_t imu_enabled = 0;
 static uint32_t imu_last_update_ms = 0;
 static int32_t heading_target_cdeg = 0;
 static uint8_t heading_hold_active = 0;
+static uint8_t forward_launch_active = 0;
+static uint32_t forward_launch_start_ms = 0;
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -110,7 +123,10 @@ static void StopControlOutput(void)
     PID_Clear(&pid_straight_sync);
     PID_Clear(&pid_heading_hold);
     straight_sync_adjust = 0.0f;
+    heading_hold_adjust = 0.0f;
+    heading_hold_error_cdeg = 0;
     heading_hold_active = 0;
+    forward_launch_active = 0;
     left_pwm = 0;
     right_pwm = 0;
     Motor_Left_SetSignedPWM(0);
@@ -124,8 +140,23 @@ static float LimitTargetSpeed(float target)
     return target;
 }
 
+static float LimitFloat(float value, float min, float max)
+{
+    if (value > max) value = max;
+    if (value < min) value = min;
+    return value;
+}
+
+static float GetCorrectedGyroZDps(void)
+{
+    int32_t corrected_raw = (int32_t)imu_gyro_raw.z - (int32_t)imu_gyro_offset.z;
+    return ((float)corrected_raw * HEADING_HOLD_GYRO_FS_DPS) / HEADING_HOLD_GYRO_RAW_FULL_SCALE;
+}
+
 static void ApplyStraightSyncCorrection(const RemoteControl_State_t *remote)
 {
+    float target_speed_diff;
+
     if (remote->turn != 0)
     {
         PID_Clear(&pid_straight_sync);
@@ -133,12 +164,49 @@ static void ApplyStraightSyncCorrection(const RemoteControl_State_t *remote)
         return;
     }
 
+    target_speed_diff = target_left_speed - target_right_speed;
     straight_sync_adjust = PID_Calc(&pid_straight_sync,
-                                    0.0f,
+                                    target_speed_diff,
                                     (float)left_speed - (float)right_speed);
 
     target_left_speed = LimitTargetSpeed(target_left_speed + straight_sync_adjust);
     target_right_speed = LimitTargetSpeed(target_right_speed - straight_sync_adjust);
+}
+
+static void ApplyForwardLeftDriftTrim(const RemoteControl_State_t *remote, uint32_t now)
+{
+    float trim = FORWARD_LEFT_DRIFT_TRIM;
+
+    if (remote->turn != 0 || remote->throttle <= 0)
+    {
+        forward_launch_active = 0;
+        return;
+    }
+
+    if (!forward_launch_active)
+    {
+        forward_launch_active = 1;
+        forward_launch_start_ms = now;
+    }
+
+    if ((now - forward_launch_start_ms) < FORWARD_START_TRIM_MS)
+    {
+        trim += FORWARD_START_LEFT_DRIFT_TRIM;
+    }
+
+    target_left_speed = LimitTargetSpeed(target_left_speed + trim);
+    target_right_speed = LimitTargetSpeed(target_right_speed - trim);
+}
+
+static void ApplyBackwardRightDriftTrim(const RemoteControl_State_t *remote)
+{
+    if (remote->turn != 0 || remote->throttle >= 0)
+    {
+        return;
+    }
+
+    target_left_speed = LimitTargetSpeed(target_left_speed - BACKWARD_RIGHT_DRIFT_TRIM);
+    target_right_speed = LimitTargetSpeed(target_right_speed + BACKWARD_RIGHT_DRIFT_TRIM);
 }
 
 static int32_t WrapYawErrorCdeg(int32_t error_cdeg)
@@ -209,6 +277,8 @@ static void ApplyHeadingHoldCorrection(const RemoteControl_State_t *remote)
     if (!imu_heading_ready || remote->turn != 0)
     {
         heading_hold_active = 0;
+        heading_hold_adjust = 0.0f;
+        heading_hold_error_cdeg = 0;
         PID_Clear(&pid_heading_hold);
         return;
     }
@@ -217,15 +287,27 @@ static void ApplyHeadingHoldCorrection(const RemoteControl_State_t *remote)
     {
         heading_target_cdeg = imu_yaw_cdeg;
         heading_hold_active = 1;
+        heading_hold_adjust = 0.0f;
+        heading_hold_error_cdeg = 0;
         PID_Clear(&pid_heading_hold);
-        return;
     }
 
-    int32_t yaw_error_cdeg = WrapYawErrorCdeg(imu_yaw_cdeg - heading_target_cdeg);
-    float heading_adjust = PID_Calc(&pid_heading_hold, 0.0f, (float)yaw_error_cdeg / 100.0f);
+    heading_hold_error_cdeg = WrapYawErrorCdeg(imu_yaw_cdeg - heading_target_cdeg);
+    if (Attitude_Abs32(heading_hold_error_cdeg) <= HEADING_HOLD_DEADBAND_CDEG)
+    {
+        heading_hold_error_cdeg = 0;
+    }
 
-    target_left_speed = LimitTargetSpeed(target_left_speed - heading_adjust);
-    target_right_speed = LimitTargetSpeed(target_right_speed + heading_adjust);
+    heading_hold_adjust = PID_Calc(&pid_heading_hold,
+                                   0.0f,
+                                   ((float)heading_hold_error_cdeg * HEADING_HOLD_YAW_SIGN) / 100.0f);
+    heading_hold_adjust -= GetCorrectedGyroZDps() * HEADING_HOLD_YAW_SIGN * HEADING_HOLD_RATE_GAIN;
+    heading_hold_adjust = LimitFloat(heading_hold_adjust,
+                                     -HEADING_HOLD_OUTPUT_LIMIT,
+                                     HEADING_HOLD_OUTPUT_LIMIT);
+
+    target_left_speed = LimitTargetSpeed(target_left_speed - heading_hold_adjust);
+    target_right_speed = LimitTargetSpeed(target_right_speed + heading_hold_adjust);
 }
 
 /* USER CODE END 0 */
@@ -377,6 +459,10 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
             return;
         }
 
+        uint32_t now = HAL_GetTick();
+
+        ApplyForwardLeftDriftTrim(remote, now);
+        ApplyBackwardRightDriftTrim(remote);
         ApplyStraightSyncCorrection(remote);
         ApplyHeadingHoldCorrection(remote);
 
